@@ -2266,10 +2266,15 @@ impl AgentFS {
                 .await?;
             stmt.execute((now_secs, now_secs, now_nsec, now_nsec, parent_ino))
                 .await?;
+            // A directory has no other links: its inode goes with its entry.
+            let mut stmt = conn
+                .prepare_cached("DELETE FROM fs_inode WHERE ino = ?")
+                .await?;
+            stmt.execute((ino,)).await?;
+        } else {
+            // Delete the inode if this was its last link and it is not open
+            self.purge_if_unlinked(&conn, ino).await?;
         }
-
-        // Delete the inode if this was its last link and it is not open
-        self.purge_if_unlinked(&conn, ino).await?;
 
         Ok(())
     }
@@ -5109,6 +5114,18 @@ mod tests {
         assert!(FileSystem::getattr(&fs, orphan.ino).await?.is_none());
         assert_eq!(fs.get_chunk_count(orphan.ino).await?, 0);
         assert_eq!(fs.read_file("/keep").await?.unwrap(), b"keep");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_remove_dir_deletes_directory_inode() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+        let before = fs.statfs().await?.inodes;
+        fs.mkdir("/d", 0, 0).await?;
+        let d = fs.stat("/d").await?.unwrap();
+        fs.remove("/d").await?;
+        assert!(FileSystem::getattr(&fs, d.ino).await?.is_none());
+        assert_eq!(fs.statfs().await?.inodes, before);
         Ok(())
     }
 
