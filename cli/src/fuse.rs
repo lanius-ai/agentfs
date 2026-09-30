@@ -1010,10 +1010,12 @@ impl Filesystem for AgentFSFuse {
     ///
     /// Removes the file handle from the open files table.
     /// Since writes go directly to the database, no flushing is needed.
+    /// If this was the last handle of an unlinked inode, the filesystem
+    /// deletes the inode now.
     fn release(
         &mut self,
         _req: &Request,
-        _ino: u64,
+        ino: u64,
         fh: u64,
         _flags: i32,
         _lock_owner: Option<u64>,
@@ -1021,7 +1023,15 @@ impl Filesystem for AgentFSFuse {
         reply: ReplyEmpty,
     ) {
         tracing::debug!("FUSE::release: fh={}", fh);
-        self.open_files.lock().remove(&fh);
+        // Drop the handle before release() so the inode no longer counts as open.
+        drop(self.open_files.lock().remove(&fh));
+        let fs = self.fs.clone();
+        if let Err(e) = self
+            .runtime
+            .block_on(async move { fs.release(ino as i64).await })
+        {
+            tracing::warn!("release: purging ino {} failed: {}", ino, e);
+        }
         reply.ok();
     }
 

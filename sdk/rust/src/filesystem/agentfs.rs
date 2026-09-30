@@ -1,6 +1,7 @@
 use crate::error::{Error, Result};
 use async_trait::async_trait;
 use lru::LruCache;
+use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -71,7 +72,12 @@ pub struct AgentFS {
     chunk_size: usize,
     /// Cache for directory entry lookups (shared across clones)
     dentry_cache: Arc<DentryCache>,
+    /// Open file handles per inode (shared across clones). An unlinked inode
+    /// keeps its rows while it has open handles (POSIX orphan semantics).
+    open_inodes: OpenInodes,
 }
+
+type OpenInodes = Arc<Mutex<HashMap<i64, usize>>>;
 
 /// An open file handle for AgentFS.
 ///
@@ -81,6 +87,19 @@ pub struct AgentFSFile {
     pool: ConnectionPool,
     ino: i64,
     chunk_size: usize,
+    open_inodes: OpenInodes,
+}
+
+impl Drop for AgentFSFile {
+    fn drop(&mut self) {
+        let mut open = self.open_inodes.lock().unwrap();
+        if let Some(n) = open.get_mut(&self.ino) {
+            *n -= 1;
+            if *n == 0 {
+                open.remove(&self.ino);
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -447,8 +466,81 @@ impl AgentFS {
             pool,
             chunk_size,
             dentry_cache: Arc::new(DentryCache::new(DENTRY_CACHE_MAX_SIZE)),
+            open_inodes: Arc::default(),
         };
         Ok(fs)
+    }
+
+    /// Create a handle for `ino`, counted in `open_inodes` until dropped.
+    fn file_handle(&self, ino: i64) -> BoxedFile {
+        *self.open_inodes.lock().unwrap().entry(ino).or_default() += 1;
+        Arc::new(AgentFSFile {
+            pool: self.pool.clone(),
+            ino,
+            chunk_size: self.chunk_size,
+            open_inodes: self.open_inodes.clone(),
+        })
+    }
+
+    /// Delete `ino` with its data and symlink rows if it has no links left
+    /// and no open handles. An unlinked but open inode is kept (nlink 0, no
+    /// dentry) until its last handle is released, or until the next
+    /// `purge_orphans` if the process dies first. Returns whether it was deleted.
+    async fn purge_if_unlinked(&self, conn: &Connection, ino: i64) -> Result<bool> {
+        if self.get_link_count(conn, ino).await? != 0
+            || self.open_inodes.lock().unwrap().contains_key(&ino)
+        {
+            return Ok(false);
+        }
+        for sql in [
+            "DELETE FROM fs_data WHERE ino = ?",
+            "DELETE FROM fs_symlink WHERE ino = ?",
+            "DELETE FROM fs_inode WHERE ino = ?",
+        ] {
+            conn.prepare_cached(sql).await?.execute((ino,)).await?;
+        }
+        Ok(true)
+    }
+
+    /// Delete every unlinked inode (nlink 0 and no directory entry) that has
+    /// no open handle. Such inodes are left behind when the process exits
+    /// while an unlinked file is still open. Call before serving a mount;
+    /// returns the number of inodes purged.
+    pub async fn purge_orphans(&self) -> Result<u64> {
+        let conn = self.pool.get_connection().await?;
+        let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
+        let result: Result<u64> = async {
+            let mut orphans = Vec::new();
+            let mut rows = conn
+                .query(
+                    "SELECT ino FROM fs_inode WHERE nlink = 0 AND ino != ?
+                     AND ino NOT IN (SELECT ino FROM fs_dentry)",
+                    (ROOT_INO,),
+                )
+                .await?;
+            while let Some(row) = rows.next().await? {
+                if let Some(ino) = row.get_value(0).ok().and_then(|v| v.as_integer().copied()) {
+                    orphans.push(ino);
+                }
+            }
+            drop(rows);
+            let mut purged = 0;
+            for ino in orphans {
+                purged += self.purge_if_unlinked(&conn, ino).await? as u64;
+            }
+            Ok(purged)
+        }
+        .await;
+        match result {
+            Ok(n) => {
+                txn.commit().await?;
+                Ok(n)
+            }
+            Err(e) => {
+                let _ = txn.rollback().await;
+                Err(e)
+            }
+        }
     }
 
     /// Get the configured chunk size
@@ -1297,11 +1389,7 @@ impl AgentFS {
             rdev: 0,
         };
 
-        let file: BoxedFile = Arc::new(AgentFSFile {
-            pool: self.pool.clone(),
-            ino,
-            chunk_size: self.chunk_size,
-        });
+        let file = self.file_handle(ino);
 
         Ok((stats, file))
     }
@@ -2180,28 +2268,8 @@ impl AgentFS {
                 .await?;
         }
 
-        // Check if this was the last link to the inode
-        let link_count = self.get_link_count(&conn, ino).await?;
-        if link_count == 0 {
-            // Manually handle cascading deletes since we don't use foreign keys
-            // Delete data blocks
-            let mut stmt = conn
-                .prepare_cached("DELETE FROM fs_data WHERE ino = ?")
-                .await?;
-            stmt.execute((ino,)).await?;
-
-            // Delete symlink if exists
-            let mut stmt = conn
-                .prepare_cached("DELETE FROM fs_symlink WHERE ino = ?")
-                .await?;
-            stmt.execute((ino,)).await?;
-
-            // Delete inode
-            let mut stmt = conn
-                .prepare_cached("DELETE FROM fs_inode WHERE ino = ?")
-                .await?;
-            stmt.execute((ino,)).await?;
-        }
+        // Delete the inode if this was its last link and it is not open
+        self.purge_if_unlinked(&conn, ino).await?;
 
         Ok(())
     }
@@ -2354,22 +2422,8 @@ impl AgentFS {
                     .await?;
                 stmt.execute((dst_ino,)).await?;
 
-                // Clean up destination inode if no more links
-                let link_count = self.get_link_count(&conn, dst_ino).await?;
-                if link_count == 0 {
-                    let mut stmt = conn
-                        .prepare_cached("DELETE FROM fs_data WHERE ino = ?")
-                        .await?;
-                    stmt.execute((dst_ino,)).await?;
-                    let mut stmt = conn
-                        .prepare_cached("DELETE FROM fs_symlink WHERE ino = ?")
-                        .await?;
-                    stmt.execute((dst_ino,)).await?;
-                    let mut stmt = conn
-                        .prepare_cached("DELETE FROM fs_inode WHERE ino = ?")
-                        .await?;
-                    stmt.execute((dst_ino,)).await?;
-                }
+                // Clean up destination inode if no more links and not open
+                self.purge_if_unlinked(&conn, dst_ino).await?;
             }
 
             // Update the dentry: change parent and/or name
@@ -2515,11 +2569,7 @@ impl AgentFS {
         let path = self.normalize_path(path);
         let ino = self.resolve_path(&path).await?.ok_or(FsError::NotFound)?;
 
-        Ok(Arc::new(AgentFSFile {
-            pool: self.pool.clone(),
-            ino,
-            chunk_size: self.chunk_size,
-        }))
+        Ok(self.file_handle(ino))
     }
 
     /// Get the number of chunks for a given inode (for testing)
@@ -2967,11 +3017,7 @@ impl FileSystem for AgentFS {
             return Err(FsError::NotFound.into());
         }
 
-        Ok(Arc::new(AgentFSFile {
-            pool: self.pool.clone(),
-            ino,
-            chunk_size: self.chunk_size,
-        }))
+        Ok(self.file_handle(ino))
     }
 
     async fn mkdir(
@@ -3149,11 +3195,7 @@ impl FileSystem for AgentFS {
             rdev: 0,
         };
 
-        let file: BoxedFile = Arc::new(AgentFSFile {
-            pool: self.pool.clone(),
-            ino,
-            chunk_size: self.chunk_size,
-        });
+        let file = self.file_handle(ino);
 
         Ok((stats, file))
     }
@@ -3395,27 +3437,8 @@ impl FileSystem for AgentFS {
             .await?;
         stmt.execute((now_secs, now_nsec, ino)).await?;
 
-        // Check if this was the last link to the inode
-        let link_count = self.get_link_count(&conn, ino).await?;
-        if link_count == 0 {
-            // Delete data blocks
-            let mut stmt = conn
-                .prepare_cached("DELETE FROM fs_data WHERE ino = ?")
-                .await?;
-            stmt.execute((ino,)).await?;
-
-            // Delete symlink if exists
-            let mut stmt = conn
-                .prepare_cached("DELETE FROM fs_symlink WHERE ino = ?")
-                .await?;
-            stmt.execute((ino,)).await?;
-
-            // Delete inode
-            let mut stmt = conn
-                .prepare_cached("DELETE FROM fs_inode WHERE ino = ?")
-                .await?;
-            stmt.execute((ino,)).await?;
-        }
+        // Delete the inode if this was its last link and it is not open
+        self.purge_if_unlinked(&conn, ino).await?;
 
         Ok(())
     }
@@ -3661,22 +3684,8 @@ impl FileSystem for AgentFS {
                     .await?;
                 stmt.execute((now_dec, now_dec_nsec, dst_ino)).await?;
 
-                // Clean up destination inode if no more links
-                let link_count = self.get_link_count(&conn, dst_ino).await?;
-                if link_count == 0 {
-                    let mut stmt = conn
-                        .prepare_cached("DELETE FROM fs_data WHERE ino = ?")
-                        .await?;
-                    stmt.execute((dst_ino,)).await?;
-                    let mut stmt = conn
-                        .prepare_cached("DELETE FROM fs_symlink WHERE ino = ?")
-                        .await?;
-                    stmt.execute((dst_ino,)).await?;
-                    let mut stmt = conn
-                        .prepare_cached("DELETE FROM fs_inode WHERE ino = ?")
-                        .await?;
-                    stmt.execute((dst_ino,)).await?;
-                }
+                // Clean up destination inode if no more links and not open
+                self.purge_if_unlinked(&conn, dst_ino).await?;
             }
 
             // Update the dentry: change parent and/or name
@@ -3754,6 +3763,15 @@ impl FileSystem for AgentFS {
 
     async fn statfs(&self) -> Result<FilesystemStats> {
         AgentFS::statfs(self).await
+    }
+
+    async fn release(&self, ino: i64) -> Result<()> {
+        if self.open_inodes.lock().unwrap().contains_key(&ino) {
+            return Ok(());
+        }
+        let conn = self.pool.get_connection().await?;
+        self.purge_if_unlinked(&conn, ino).await?;
+        Ok(())
     }
 }
 
@@ -4208,7 +4226,8 @@ mod tests {
         let ino = fs.resolve_path("/deleteme.txt").await?.unwrap();
         assert_eq!(fs.get_chunk_count(ino).await?, 4);
 
-        // Delete the file
+        // Delete the file (closed: an open file keeps its data until release)
+        drop(file);
         fs.remove("/deleteme.txt").await?;
 
         // Verify all chunks are gone
@@ -4913,6 +4932,93 @@ mod tests {
         let stats = fs.lstat("/link.txt").await?.unwrap();
         assert!(stats.is_symlink(), "Should still be a symlink");
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_unlink_while_open_keeps_inode_until_release() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+        let (stats, file) = fs.create_file("/tmp.txt", DEFAULT_FILE_MODE, 0, 0).await?;
+        file.pwrite(0, b"still here").await?;
+
+        FileSystem::unlink(&fs, ROOT_INO, "tmp.txt").await?;
+        assert!(FileSystem::lookup(&fs, ROOT_INO, "tmp.txt")
+            .await?
+            .is_none());
+        assert_eq!(file.pread(0, 64).await?, b"still here");
+        assert_eq!(file.fstat().await?.nlink, 0);
+        file.pwrite(10, b"!").await?;
+        assert_eq!(file.pread(0, 64).await?, b"still here!");
+
+        // Releasing another handle while this one is open must not purge.
+        let other = FileSystem::open(&fs, stats.ino, libc::O_RDONLY).await?;
+        drop(other);
+        FileSystem::release(&fs, stats.ino).await?;
+        assert_eq!(fs.get_chunk_count(stats.ino).await?, 1);
+
+        drop(file);
+        FileSystem::release(&fs, stats.ino).await?;
+        assert!(FileSystem::getattr(&fs, stats.ino).await?.is_none());
+        assert_eq!(fs.get_chunk_count(stats.ino).await?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_unlink_closed_file_deletes_immediately() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+        let (stats, file) = fs.create_file("/f.txt", DEFAULT_FILE_MODE, 0, 0).await?;
+        file.pwrite(0, b"data").await?;
+        drop(file);
+        FileSystem::unlink(&fs, ROOT_INO, "f.txt").await?;
+        assert!(FileSystem::getattr(&fs, stats.ino).await?.is_none());
+        assert_eq!(fs.get_chunk_count(stats.ino).await?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_rename_over_open_file_keeps_inode_until_release() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+        let (old, old_file) = fs.create_file("/a", DEFAULT_FILE_MODE, 0, 0).await?;
+        old_file.pwrite(0, b"old").await?;
+        let (_, new_file) = fs.create_file("/b", DEFAULT_FILE_MODE, 0, 0).await?;
+        new_file.pwrite(0, b"new").await?;
+        drop(new_file);
+
+        FileSystem::rename(&fs, ROOT_INO, "b", ROOT_INO, "a").await?;
+        assert_eq!(fs.read_file("/a").await?.unwrap(), b"new");
+        assert_eq!(old_file.pread(0, 16).await?, b"old");
+
+        drop(old_file);
+        FileSystem::release(&fs, old.ino).await?;
+        assert!(FileSystem::getattr(&fs, old.ino).await?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_purge_orphans_only_deletes_unreachable_inodes() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+        // An unlinked-but-open inode whose process died before RELEASE.
+        let (orphan, file) = fs.create_file("/tmp", DEFAULT_FILE_MODE, 0, 0).await?;
+        file.pwrite(0, b"x").await?;
+        FileSystem::unlink(&fs, ROOT_INO, "tmp").await?;
+        // Still open: never purged.
+        assert_eq!(fs.purge_orphans().await?, 0);
+        drop(file);
+
+        // A linked inode with a wrong nlink of 0 (written by another tool)
+        // must survive: it still has a directory entry.
+        let (linked, file) = fs.create_file("/keep", DEFAULT_FILE_MODE, 0, 0).await?;
+        file.pwrite(0, b"keep").await?;
+        drop(file);
+        let conn = fs.get_connection().await?;
+        conn.execute("UPDATE fs_inode SET nlink = 0 WHERE ino = ?", (linked.ino,))
+            .await?;
+        drop(conn);
+
+        assert_eq!(fs.purge_orphans().await?, 1);
+        assert!(FileSystem::getattr(&fs, orphan.ino).await?.is_none());
+        assert_eq!(fs.get_chunk_count(orphan.ino).await?, 0);
+        assert_eq!(fs.read_file("/keep").await?.unwrap(), b"keep");
         Ok(())
     }
 }

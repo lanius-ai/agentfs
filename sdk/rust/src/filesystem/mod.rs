@@ -318,4 +318,15 @@ pub trait FileSystem: Send + Sync {
     async fn forget(&self, _ino: i64, _nlookup: u64) {
         // Default: no-op
     }
+
+    /// Called after an open file handle for `ino` has been dropped.
+    ///
+    /// Filesystems that keep unlinked-but-open inodes alive (AgentFS) delete
+    /// the inode here once its last handle is gone. The default is a no-op.
+    // ponytail: OverlayFS does not forward this to its delta layer, so an
+    // orphan unlinked through an overlay mount lives until the next
+    // AgentFS::purge_orphans (next mount).
+    async fn release(&self, _ino: i64) -> Result<()> {
+        Ok(())
+    }
 }

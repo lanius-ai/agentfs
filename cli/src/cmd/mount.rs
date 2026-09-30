@@ -145,6 +145,9 @@ fn mount_fuse(args: MountArgs) -> Result<()> {
 
         // Check for overlay configuration
         let fs: Arc<dyn FileSystem> = rt.block_on(async {
+            // Inodes unlinked while open when a previous mount exited.
+            agentfs.fs.purge_orphans().await?;
+
             // Query base_path in a separate scope so connection is released
             let base_path: Option<String> = {
                 let conn = agentfs.get_connection().await?;
