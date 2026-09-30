@@ -149,6 +149,8 @@ fn mount_fuse(args: MountArgs) -> Result<()> {
             Err(e) => return Err(e.into()),
         };
 
+        let pool = agentfs.fs.get_pool();
+
         // Check for overlay configuration
         let fs: Arc<dyn FileSystem> = rt.block_on(async {
             // Inodes unlinked while open when a previous mount exited.
@@ -190,7 +192,31 @@ fn mount_fuse(args: MountArgs) -> Result<()> {
             }
         })?;
 
-        crate::fuse::mount(fs, fuse_opts, rt)
+        // SIGTERM: checkpoint and exit 0, holding the only pooled connection so
+        // no FUSE request can write after the checkpoint.
+        let term_pool = pool.clone();
+        let handle = rt.handle().clone();
+        let mut sigterm = {
+            let _rt = rt.enter();
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?
+        };
+        std::thread::spawn(move || {
+            handle.block_on(async move {
+                sigterm.recv().await;
+                match checkpoint(&term_pool).await {
+                    Ok(_conn) => std::process::exit(0),
+                    Err(e) => {
+                        eprintln!("Error: checkpoint on SIGTERM: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            })
+        });
+
+        crate::fuse::mount(fs, fuse_opts, rt)?;
+        // Unmounted (ENODEV): leave a complete database file without a -wal.
+        crate::get_runtime().block_on(checkpoint(&pool))?;
+        Ok(())
     };
 
     if args.foreground {
@@ -202,6 +228,27 @@ fn mount_fuse(args: MountArgs) -> Result<()> {
             std::time::Duration::from_secs(10),
         )
     }
+}
+
+/// `PRAGMA wal_checkpoint(TRUNCATE)`: copy the WAL into the database file and
+/// truncate it, so the file alone is the complete filesystem. Returns the
+/// connection used; holding it keeps other writers out of the pool.
+#[cfg(target_os = "linux")]
+async fn checkpoint(
+    pool: &agentfs_sdk::connection_pool::ConnectionPool,
+) -> Result<agentfs_sdk::connection_pool::PooledConnection> {
+    let conn = pool.get_connection().await?;
+    let mut rows = conn.query("PRAGMA wal_checkpoint(TRUNCATE)", ()).await?;
+    let mut busy = None;
+    while let Some(row) = rows.next().await? {
+        busy = row.get_value(0).ok().and_then(|v| v.as_integer().copied());
+    }
+    drop(rows);
+    anyhow::ensure!(
+        busy == Some(0),
+        "wal_checkpoint(TRUNCATE) did not complete (busy={busy:?})"
+    );
+    Ok(conn)
 }
 
 /// Mount the agent filesystem using NFS over localhost.
