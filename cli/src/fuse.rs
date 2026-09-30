@@ -1,7 +1,7 @@
 use crate::fuser::{
     consts::{
-        FUSE_ASYNC_READ, FUSE_CACHE_SYMLINKS, FUSE_NO_OPENDIR_SUPPORT, FUSE_PARALLEL_DIROPS,
-        FUSE_WRITEBACK_CACHE,
+        FOPEN_KEEP_CACHE, FOPEN_NOFLUSH, FUSE_ASYNC_READ, FUSE_CACHE_SYMLINKS,
+        FUSE_NO_OPENDIR_SUPPORT, FUSE_PARALLEL_DIROPS, FUSE_WRITEBACK_CACHE,
     },
     fuse_forget_one, FileAttr, FileType, Filesystem, KernelConfig, MountOption, ReplyAttr,
     ReplyCreate, ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen,
@@ -77,6 +77,17 @@ fn maximize_fd_limit() {
 /// nanoseconds, where `u64::MAX` seconds wraps negative and every cached entry
 /// is treated as already expired (a GETATTR/LOOKUP round trip per access).
 const TTL: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+
+/// FOPEN flags for every open/create reply.
+///
+/// - KEEP_CACHE: we are the only writer, so cached pages stay valid across
+///   opens; without it each open drops the file's page cache.
+/// - NOFLUSH: `flush` is a no-op (writes go straight to the database), so the
+///   FLUSH round trip on close is skipped. Linux ignores it under writeback
+///   caching, where FLUSH still writes back dirty pages.
+///
+/// Never DIRECT_IO: it bypasses the page cache and so forbids shared mmap.
+const OPEN_FLAGS: u32 = FOPEN_KEEP_CACHE | FOPEN_NOFLUSH;
 
 /// Options for mounting an agent filesystem via FUSE.
 #[derive(Debug, Clone)]
@@ -678,7 +689,7 @@ impl Filesystem for AgentFSFuse {
                 let fh = self.alloc_fh();
                 self.open_files.lock().insert(fh, OpenFile { file });
 
-                reply.created(&TTL, &attr, 0, fh, 0);
+                reply.created(&TTL, &attr, 0, fh, OPEN_FLAGS);
             }
             Err(e) => {
                 reply.error(error_to_errno(&e));
@@ -876,7 +887,7 @@ impl Filesystem for AgentFSFuse {
             Ok(file) => {
                 let fh = self.alloc_fh();
                 self.open_files.lock().insert(fh, OpenFile { file });
-                reply.opened(fh, 0);
+                reply.opened(fh, OPEN_FLAGS);
             }
             Err(e) => reply.error(error_to_errno(&e)),
         }

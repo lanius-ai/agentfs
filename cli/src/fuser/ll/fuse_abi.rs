@@ -150,7 +150,8 @@ pub mod consts {
     pub const FOPEN_NONSEEKABLE: u32 = 1 << 2; // the file is not seekable
     pub const FOPEN_CACHE_DIR: u32 = 1 << 3; // allow caching this directory
     pub const FOPEN_STREAM: u32 = 1 << 4; // the file is stream-like (no file position at all)
-                                          // Init request/reply flags
+    pub const FOPEN_NOFLUSH: u32 = 1 << 5; // don't flush data cache on close (unless FUSE_WRITEBACK_CACHE)
+                                           // Init request/reply flags
     pub const FUSE_ASYNC_READ: u64 = 1 << 0; // asynchronous read requests
     pub const FUSE_POSIX_LOCKS: u64 = 1 << 1; // remote locking for POSIX file locks
     pub const FUSE_FILE_OPS: u64 = 1 << 2; // kernel sends file handle for fstat, etc...
