@@ -202,7 +202,11 @@ fn mount_fuse(args: MountArgs) -> Result<()> {
         };
         std::thread::spawn(move || {
             handle.block_on(async move {
-                sigterm.recv().await;
+                // None: the runtime shut down after unmount; the main thread
+                // checkpoints.
+                if sigterm.recv().await.is_none() {
+                    return;
+                }
                 match checkpoint(&term_pool).await {
                     Ok(_conn) => std::process::exit(0),
                     Err(e) => {
