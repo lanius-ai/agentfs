@@ -41,6 +41,8 @@ pub(super) fn mount_fuse(
     use crate::fuse::FuseMountOptions;
 
     let fuse_opts = FuseMountOptions {
+        max_bytes: None,
+        max_inodes: None,
         mountpoint: opts.mountpoint.clone(),
         auto_unmount: opts.auto_unmount,
         allow_root: opts.allow_root,

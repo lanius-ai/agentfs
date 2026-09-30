@@ -25,6 +25,10 @@ pub struct MountArgs {
     pub gid: Option<u32>,
     /// The mount backend to use (fuse or nfs).
     pub backend: MountBackend,
+    /// FUSE only: maximum total file bytes (ENOSPC beyond).
+    pub max_bytes: Option<u64>,
+    /// FUSE only: maximum number of inodes (ENOSPC beyond).
+    pub max_inodes: Option<u64>,
 }
 
 /// List all currently mounted agentfs filesystems

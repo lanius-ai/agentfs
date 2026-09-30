@@ -107,6 +107,35 @@ pub struct FuseMountOptions {
     pub uid: Option<u32>,
     /// Group ID to report for all files (defaults to current group).
     pub gid: Option<u32>,
+    /// Maximum total file size in bytes; writes beyond it fail with ENOSPC.
+    pub max_bytes: Option<u64>,
+    /// Maximum number of inodes; creates beyond it fail with ENOSPC.
+    pub max_inodes: Option<u64>,
+}
+
+/// Write-time quota on total file bytes and inodes.
+///
+/// `bytes`/`inodes` are upper bounds on current usage: creates and growth are
+/// charged exactly, deletions are not tracked. When a charge would exceed a
+/// limit, usage is recounted from the database before failing with ENOSPC.
+// ponytail: close to a limit every charge recounts (a full fs_inode scan);
+// track deletions if that ever matters.
+#[derive(Default)]
+struct Quota {
+    max_bytes: Option<u64>,
+    max_inodes: Option<u64>,
+    bytes: u64,
+    inodes: u64,
+}
+
+impl Quota {
+    fn fits(&self, bytes: u64, inodes: u64) -> bool {
+        self.max_bytes
+            .is_none_or(|max| self.bytes.saturating_add(bytes) <= max)
+            && self
+                .max_inodes
+                .is_none_or(|max| self.inodes.saturating_add(inodes) <= max)
+    }
 }
 
 /// Tracks an open file handle
@@ -125,6 +154,7 @@ struct AgentFSFuse {
     /// Owner reported for every inode (`--uid`/`--gid`), if set.
     uid: Option<u32>,
     gid: Option<u32>,
+    quota: Quota,
 }
 
 impl Filesystem for AgentFSFuse {
@@ -280,6 +310,10 @@ impl Filesystem for AgentFSFuse {
 
         // Handle truncate
         if let Some(new_size) = size {
+            if let Err(errno) = self.charge_size(None, ino, new_size) {
+                reply.error(errno);
+                return;
+            }
             let result = if let Some(fh) = fh {
                 // Use file handle if available (ftruncate)
                 let file = {
@@ -550,6 +584,11 @@ impl Filesystem for AgentFSFuse {
             return;
         };
 
+        if let Err(errno) = self.charge(0, 1) {
+            reply.error(errno);
+            return;
+        }
+
         let uid = req.uid();
         let gid = req.gid();
         let fs = self.fs.clone();
@@ -594,6 +633,11 @@ impl Filesystem for AgentFSFuse {
             reply.error(libc::EINVAL);
             return;
         };
+
+        if let Err(errno) = self.charge(0, 1) {
+            reply.error(errno);
+            return;
+        }
 
         let uid = req.uid();
         let gid = req.gid();
@@ -672,6 +716,11 @@ impl Filesystem for AgentFSFuse {
         };
 
         // Create file with mode, get stats and file handle in one operation
+        if let Err(errno) = self.charge(0, 1) {
+            reply.error(errno);
+            return;
+        }
+
         let uid = req.uid();
         let gid = req.gid();
         let fs = self.fs.clone();
@@ -723,6 +772,11 @@ impl Filesystem for AgentFSFuse {
             reply.error(libc::EINVAL);
             return;
         };
+
+        if let Err(errno) = self.charge(0, 1) {
+            reply.error(errno);
+            return;
+        }
 
         let uid = req.uid();
         let gid = req.gid();
@@ -952,6 +1006,11 @@ impl Filesystem for AgentFSFuse {
             open_file.file.clone()
         };
 
+        if let Err(errno) = self.charge_size(Some(&file), 0, offset as u64 + data.len() as u64) {
+            reply.error(errno);
+            return;
+        }
+
         let data_len = data.len();
         let data_vec = data.to_vec();
         let result = self
@@ -1051,16 +1110,22 @@ impl Filesystem for AgentFSFuse {
             Err(_) => (0, 1), // Fallback: just root inode
         };
 
-        // Report a large virtual capacity so tools don't think we're out of space
+        // Report the quota if set, else a large virtual capacity so tools don't
+        // think we're out of space.
         const TOTAL_BLOCKS: u64 = 1024 * 1024 * 1024; // ~4TB virtual size
-        let free_blocks = TOTAL_BLOCKS.saturating_sub(used_blocks);
-        let free_inodes = TOTAL_INODES.saturating_sub(used_inodes);
+        let total_blocks = self
+            .quota
+            .max_bytes
+            .map_or(TOTAL_BLOCKS, |b| b / BLOCK_SIZE);
+        let total_inodes = self.quota.max_inodes.unwrap_or(TOTAL_INODES);
+        let free_blocks = total_blocks.saturating_sub(used_blocks);
+        let free_inodes = total_inodes.saturating_sub(used_inodes);
 
         reply.statfs(
-            TOTAL_BLOCKS,
+            total_blocks,
             free_blocks,
             free_blocks,
-            TOTAL_INODES,
+            total_inodes,
             free_inodes,
             BLOCK_SIZE as u32,
             MAX_NAMELEN,       // namelen: maximum filename length
@@ -1114,7 +1179,63 @@ impl AgentFSFuse {
             next_fh: AtomicU64::new(1),
             uid,
             gid,
+            quota: Quota::default(),
         }
+    }
+
+    /// Set the quota limits and count current usage.
+    fn set_quota(&mut self, max_bytes: Option<u64>, max_inodes: Option<u64>) -> anyhow::Result<()> {
+        self.quota.max_bytes = max_bytes;
+        self.quota.max_inodes = max_inodes;
+        self.recount()?;
+        Ok(())
+    }
+
+    fn recount(&mut self) -> agentfs_sdk::error::Result<()> {
+        let fs = self.fs.clone();
+        let stats = self.runtime.block_on(async move { fs.statfs().await })?;
+        self.quota.bytes = stats.bytes_used;
+        self.quota.inodes = stats.inodes;
+        Ok(())
+    }
+
+    /// Charge `bytes` of growth and `inodes` new inodes against the quota.
+    /// Returns ENOSPC if they do not fit even after recounting usage.
+    fn charge(&mut self, bytes: u64, inodes: u64) -> Result<(), i32> {
+        if !self.quota.fits(bytes, inodes) {
+            self.recount().map_err(|e| error_to_errno(&e))?;
+            if !self.quota.fits(bytes, inodes) {
+                return Err(libc::ENOSPC);
+            }
+        }
+        self.quota.bytes += bytes;
+        self.quota.inodes += inodes;
+        Ok(())
+    }
+
+    /// Charge growing `ino` to `new_size` bytes (no-op without a byte limit).
+    fn charge_size(
+        &mut self,
+        file: Option<&BoxedFile>,
+        ino: u64,
+        new_size: u64,
+    ) -> Result<(), i32> {
+        if self.quota.max_bytes.is_none() {
+            return Ok(());
+        }
+        let fs = self.fs.clone();
+        let file = file.cloned();
+        let size = self.runtime.block_on(async move {
+            match file {
+                Some(f) => f.fstat().await.map(|s| s.size),
+                None => fs
+                    .getattr(ino as i64)
+                    .await
+                    .map(|s| s.map_or(0, |s| s.size)),
+            }
+        });
+        let size = size.map_err(|e| error_to_errno(&e))? as u64;
+        self.charge(new_size.saturating_sub(size), 0)
     }
 
     /// Allocate a new file handle for tracking open files.
@@ -1215,7 +1336,8 @@ pub fn mount(
     // when passthrough filesystems cache O_PATH file descriptors
     maximize_fd_limit();
 
-    let fs = AgentFSFuse::new(fs, runtime, opts.uid, opts.gid);
+    let mut fs = AgentFSFuse::new(fs, runtime, opts.uid, opts.gid);
+    fs.set_quota(opts.max_bytes, opts.max_inodes)?;
 
     let mut mount_opts = vec![
         MountOption::FSName(opts.fsname),
@@ -1270,23 +1392,56 @@ mod tests {
         }
     }
 
-    fn adapter(uid: Option<u32>, gid: Option<u32>) -> AgentFSFuse {
+    type SdkFs = agentfs_sdk::filesystem::AgentFS;
+
+    fn adapter(uid: Option<u32>, gid: Option<u32>) -> (AgentFSFuse, SdkFs, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let runtime = Runtime::new().unwrap();
         let path = dir.path().join("t.db");
         let fs = runtime
-            .block_on(agentfs_sdk::filesystem::AgentFS::new(
-                path.to_str().unwrap(),
-            ))
+            .block_on(SdkFs::new(path.to_str().unwrap()))
             .unwrap();
-        AgentFSFuse::new(Arc::new(fs), runtime, uid, gid)
+        let a = AgentFSFuse::new(Arc::new(fs.clone()), runtime, uid, gid);
+        (a, fs, dir)
     }
 
     #[test]
     fn fillattr_reports_mount_owner() {
-        let a = adapter(Some(1000), Some(1001)).fillattr(&stats(0, 0));
+        let a = adapter(Some(1000), Some(1001)).0.fillattr(&stats(0, 0));
         assert_eq!((a.uid, a.gid), (1000, 1001));
-        let a = adapter(None, None).fillattr(&stats(7, 8));
+        let a = adapter(None, None).0.fillattr(&stats(7, 8));
         assert_eq!((a.uid, a.gid), (7, 8));
+    }
+
+    #[test]
+    fn quota_enospc_counts_real_usage() {
+        let (mut a, fs, _dir) = adapter(None, None);
+        let base_inodes = a.runtime.block_on(fs.statfs()).unwrap().inodes;
+        a.set_quota(Some(100), Some(base_inodes + 2)).unwrap();
+        let write = |a: &AgentFSFuse, path: &'static str, len: usize| {
+            a.runtime
+                .block_on(async {
+                    let (_, f) = fs.create_file(path, 0o100644, 0, 0).await?;
+                    f.pwrite(0, &vec![1u8; len]).await
+                })
+                .unwrap()
+        };
+
+        // Charges are upper bounds; a recount forgives what was never written.
+        assert_eq!(a.charge(60, 0), Ok(()));
+        assert_eq!(a.charge(60, 0), Ok(()));
+
+        assert_eq!(a.charge(90, 1), Ok(()));
+        write(&a, "/f", 90);
+        assert_eq!(a.charge(11, 0), Err(libc::ENOSPC));
+        assert_eq!(a.charge(10, 0), Ok(()));
+
+        assert_eq!(a.charge(0, 1), Ok(()));
+        write(&a, "/g", 0);
+        assert_eq!(a.charge(0, 1), Err(libc::ENOSPC));
+
+        // Deleting frees both bytes and inodes.
+        a.runtime.block_on(fs.remove("/f")).unwrap();
+        assert_eq!(a.charge(100, 1), Ok(()));
     }
 }

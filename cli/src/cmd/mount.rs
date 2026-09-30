@@ -51,6 +51,10 @@ pub struct MountArgs {
     pub gid: Option<u32>,
     /// The mount backend to use (fuse or nfs).
     pub backend: MountBackend,
+    /// FUSE only: maximum total file bytes (ENOSPC beyond).
+    pub max_bytes: Option<u64>,
+    /// FUSE only: maximum number of inodes (ENOSPC beyond).
+    pub max_inodes: Option<u64>,
 }
 
 /// Mount the agent filesystem (Linux).
@@ -130,6 +134,8 @@ fn mount_fuse(args: MountArgs) -> Result<()> {
         fsname,
         uid: args.uid,
         gid: args.gid,
+        max_bytes: args.max_bytes,
+        max_inodes: args.max_inodes,
     };
 
     let id_or_path = args.id_or_path.clone();
@@ -203,6 +209,10 @@ async fn mount_nfs_backend(args: MountArgs) -> Result<()> {
     use crate::cmd::init::open_agentfs;
 
     let opts = AgentFSOptions::resolve(&args.id_or_path)?;
+
+    if args.max_bytes.is_some() || args.max_inodes.is_some() {
+        anyhow::bail!("--max-bytes/--max-inodes require the FUSE backend");
+    }
 
     if !args.mountpoint.exists() {
         anyhow::bail!("Mountpoint does not exist: {}", args.mountpoint.display());

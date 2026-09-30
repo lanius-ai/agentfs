@@ -233,7 +233,7 @@ pub enum Command {
 
         /// Allow other system users to access this mount (requires /etc/fuse.conf
         /// user_allow_other; use cautiously)
-        #[arg(long = "system")]
+        #[arg(long = "system", alias = "allow-other")]
         system: bool,
 
         /// Run in foreground (don't daemonize)
@@ -251,6 +251,15 @@ pub enum Command {
         /// Backend to use for mounting
         #[arg(long, default_value_t = MountBackend::default())]
         backend: MountBackend,
+
+        /// Maximum total file size in bytes; writes beyond it fail with ENOSPC
+        /// (FUSE only)
+        #[arg(long)]
+        max_bytes: Option<u64>,
+
+        /// Maximum number of inodes; creating more fails with ENOSPC (FUSE only)
+        #[arg(long)]
+        max_inodes: Option<u64>,
     },
     /// Show differences between base filesystem and delta (overlay mode only)
     Diff {
