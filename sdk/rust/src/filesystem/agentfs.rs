@@ -2422,8 +2422,22 @@ impl AgentFS {
                     .await?;
                 stmt.execute((dst_ino,)).await?;
 
-                // Clean up destination inode if no more links and not open
-                self.purge_if_unlinked(&conn, dst_ino).await?;
+                if dst_stats.is_directory() {
+                    // A replaced (empty) directory goes with its entry, and its
+                    // ".." link leaves the parent. Checking nlink leaked the
+                    // inode of a directory created with nlink 2.
+                    let mut stmt = conn
+                        .prepare_cached("DELETE FROM fs_inode WHERE ino = ?")
+                        .await?;
+                    stmt.execute((dst_ino,)).await?;
+                    let mut stmt = conn
+                        .prepare_cached("UPDATE fs_inode SET nlink = nlink - 1 WHERE ino = ?")
+                        .await?;
+                    stmt.execute((dst_parent_ino,)).await?;
+                } else {
+                    // Clean up destination inode if no more links and not open
+                    self.purge_if_unlinked(&conn, dst_ino).await?;
+                }
             }
 
             // Update the dentry: change parent and/or name
@@ -2570,6 +2584,143 @@ impl AgentFS {
         let ino = self.resolve_path(&path).await?.ok_or(FsError::NotFound)?;
 
         Ok(self.file_handle(ino))
+    }
+
+    async fn unlink_with_conn(&self, conn: &Connection, parent_ino: i64, name: &str) -> Result<()> {
+        // Look up the child inode
+        let ino = self
+            .lookup_child(conn, parent_ino, name)
+            .await?
+            .ok_or(FsError::NotFound)?;
+
+        // Check if it's a directory (use rmdir for directories)
+        let mut stmt = conn
+            .prepare_cached("SELECT mode FROM fs_inode WHERE ino = ?")
+            .await?;
+        let mut rows = stmt.query((ino,)).await?;
+
+        if let Some(row) = rows.next().await? {
+            let mode = row
+                .get_value(0)
+                .ok()
+                .and_then(|v| v.as_integer().copied())
+                .unwrap_or(0) as u32;
+
+            if (mode & S_IFMT) == super::S_IFDIR {
+                return Err(FsError::IsADirectory.into());
+            }
+        }
+
+        // Delete the directory entry
+        let mut stmt = conn
+            .prepare_cached("DELETE FROM fs_dentry WHERE parent_ino = ? AND name = ?")
+            .await?;
+        stmt.execute((parent_ino, name)).await?;
+
+        // Invalidate cache
+        self.dentry_cache.remove(parent_ino, name);
+
+        // Update parent directory mtime and ctime
+        let dur = SystemTime::now().duration_since(UNIX_EPOCH)?;
+        let now_secs = dur.as_secs() as i64;
+        let now_nsec = dur.subsec_nanos() as i64;
+        let mut stmt = conn
+            .prepare_cached("UPDATE fs_inode SET mtime = ?, ctime = ?, mtime_nsec = ?, ctime_nsec = ? WHERE ino = ?")
+            .await?;
+        stmt.execute((now_secs, now_secs, now_nsec, now_nsec, parent_ino))
+            .await?;
+
+        // Decrement link count and update ctime
+        let mut stmt = conn
+            .prepare_cached(
+                "UPDATE fs_inode SET nlink = nlink - 1, ctime = ?, ctime_nsec = ? WHERE ino = ?",
+            )
+            .await?;
+        stmt.execute((now_secs, now_nsec, ino)).await?;
+
+        // Delete the inode if this was its last link and it is not open
+        self.purge_if_unlinked(conn, ino).await?;
+
+        Ok(())
+    }
+
+    async fn rmdir_with_conn(&self, conn: &Connection, parent_ino: i64, name: &str) -> Result<()> {
+        // Look up the child inode
+        let ino = self
+            .lookup_child(conn, parent_ino, name)
+            .await?
+            .ok_or(FsError::NotFound)?;
+
+        if ino == ROOT_INO {
+            return Err(FsError::RootOperation.into());
+        }
+
+        // Check if it's a directory
+        let mut stmt = conn
+            .prepare_cached("SELECT mode FROM fs_inode WHERE ino = ?")
+            .await?;
+        let mut rows = stmt.query((ino,)).await?;
+
+        if let Some(row) = rows.next().await? {
+            let mode = row
+                .get_value(0)
+                .ok()
+                .and_then(|v| v.as_integer().copied())
+                .unwrap_or(0) as u32;
+
+            if (mode & S_IFMT) != super::S_IFDIR {
+                return Err(FsError::NotADirectory.into());
+            }
+        } else {
+            return Err(FsError::NotFound.into());
+        }
+
+        // Check if directory is empty
+        let mut stmt = conn
+            .prepare_cached("SELECT COUNT(*) FROM fs_dentry WHERE parent_ino = ?")
+            .await?;
+        let mut rows = stmt.query((ino,)).await?;
+
+        if let Some(row) = rows.next().await? {
+            let count = row
+                .get_value(0)
+                .ok()
+                .and_then(|v| v.as_integer().copied())
+                .unwrap_or(0);
+            if count > 0 {
+                return Err(FsError::NotEmpty.into());
+            }
+        }
+
+        // Delete the directory entry
+        let mut stmt = conn
+            .prepare_cached("DELETE FROM fs_dentry WHERE parent_ino = ? AND name = ?")
+            .await?;
+        stmt.execute((parent_ino, name)).await?;
+
+        // Invalidate cache
+        self.dentry_cache.remove(parent_ino, name);
+
+        // Decrement parent nlink (removed directory's ".." link) and update timestamps
+        let dur = SystemTime::now().duration_since(UNIX_EPOCH)?;
+        let now_secs = dur.as_secs() as i64;
+        let now_nsec = dur.subsec_nanos() as i64;
+        let mut stmt = conn
+            .prepare_cached(
+                "UPDATE fs_inode SET nlink = nlink - 1, ctime = ?, mtime = ?, ctime_nsec = ?, mtime_nsec = ? WHERE ino = ?",
+            )
+            .await?;
+        stmt.execute((now_secs, now_secs, now_nsec, now_nsec, parent_ino))
+            .await?;
+
+        // Directories cannot be hard linked, so the inode goes with its entry
+        // (checking nlink left the inode of a directory created with nlink 2).
+        let mut stmt = conn
+            .prepare_cached("DELETE FROM fs_inode WHERE ino = ?")
+            .await?;
+        stmt.execute((ino,)).await?;
+
+        Ok(())
     }
 
     /// Get the number of chunks for a given inode (for testing)
@@ -3385,62 +3536,19 @@ impl FileSystem for AgentFS {
             return Err(FsError::NameTooLong.into());
         }
         let conn = self.pool.get_connection().await?;
-
-        // Look up the child inode
-        let ino = self
-            .lookup_child(&conn, parent_ino, name)
-            .await?
-            .ok_or(FsError::NotFound)?;
-
-        // Check if it's a directory (use rmdir for directories)
-        let mut stmt = conn
-            .prepare_cached("SELECT mode FROM fs_inode WHERE ino = ?")
-            .await?;
-        let mut rows = stmt.query((ino,)).await?;
-
-        if let Some(row) = rows.next().await? {
-            let mode = row
-                .get_value(0)
-                .ok()
-                .and_then(|v| v.as_integer().copied())
-                .unwrap_or(0) as u32;
-
-            if (mode & S_IFMT) == super::S_IFDIR {
-                return Err(FsError::IsADirectory.into());
+        // One IMMEDIATE transaction: a crash mid-way must not leave a dangling
+        // entry or link count.
+        let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
+        match self.unlink_with_conn(&conn, parent_ino, name).await {
+            Ok(()) => {
+                txn.commit().await?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = txn.rollback().await;
+                Err(e)
             }
         }
-
-        // Delete the directory entry
-        let mut stmt = conn
-            .prepare_cached("DELETE FROM fs_dentry WHERE parent_ino = ? AND name = ?")
-            .await?;
-        stmt.execute((parent_ino, name)).await?;
-
-        // Invalidate cache
-        self.dentry_cache.remove(parent_ino, name);
-
-        // Update parent directory mtime and ctime
-        let dur = SystemTime::now().duration_since(UNIX_EPOCH)?;
-        let now_secs = dur.as_secs() as i64;
-        let now_nsec = dur.subsec_nanos() as i64;
-        let mut stmt = conn
-            .prepare_cached("UPDATE fs_inode SET mtime = ?, ctime = ?, mtime_nsec = ?, ctime_nsec = ? WHERE ino = ?")
-            .await?;
-        stmt.execute((now_secs, now_secs, now_nsec, now_nsec, parent_ino))
-            .await?;
-
-        // Decrement link count and update ctime
-        let mut stmt = conn
-            .prepare_cached(
-                "UPDATE fs_inode SET nlink = nlink - 1, ctime = ?, ctime_nsec = ? WHERE ino = ?",
-            )
-            .await?;
-        stmt.execute((now_secs, now_nsec, ino)).await?;
-
-        // Delete the inode if this was its last link and it is not open
-        self.purge_if_unlinked(&conn, ino).await?;
-
-        Ok(())
     }
 
     async fn rmdir(&self, parent_ino: i64, name: &str) -> Result<()> {
@@ -3448,91 +3556,19 @@ impl FileSystem for AgentFS {
             return Err(FsError::NameTooLong.into());
         }
         let conn = self.pool.get_connection().await?;
-
-        // Look up the child inode
-        let ino = self
-            .lookup_child(&conn, parent_ino, name)
-            .await?
-            .ok_or(FsError::NotFound)?;
-
-        if ino == ROOT_INO {
-            return Err(FsError::RootOperation.into());
-        }
-
-        // Check if it's a directory
-        let mut stmt = conn
-            .prepare_cached("SELECT mode FROM fs_inode WHERE ino = ?")
-            .await?;
-        let mut rows = stmt.query((ino,)).await?;
-
-        if let Some(row) = rows.next().await? {
-            let mode = row
-                .get_value(0)
-                .ok()
-                .and_then(|v| v.as_integer().copied())
-                .unwrap_or(0) as u32;
-
-            if (mode & S_IFMT) != super::S_IFDIR {
-                return Err(FsError::NotADirectory.into());
+        // One IMMEDIATE transaction: a crash mid-way must not leave a dangling
+        // entry or link count.
+        let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
+        match self.rmdir_with_conn(&conn, parent_ino, name).await {
+            Ok(()) => {
+                txn.commit().await?;
+                Ok(())
             }
-        } else {
-            return Err(FsError::NotFound.into());
-        }
-
-        // Check if directory is empty
-        let mut stmt = conn
-            .prepare_cached("SELECT COUNT(*) FROM fs_dentry WHERE parent_ino = ?")
-            .await?;
-        let mut rows = stmt.query((ino,)).await?;
-
-        if let Some(row) = rows.next().await? {
-            let count = row
-                .get_value(0)
-                .ok()
-                .and_then(|v| v.as_integer().copied())
-                .unwrap_or(0);
-            if count > 0 {
-                return Err(FsError::NotEmpty.into());
+            Err(e) => {
+                let _ = txn.rollback().await;
+                Err(e)
             }
         }
-
-        // Delete the directory entry
-        let mut stmt = conn
-            .prepare_cached("DELETE FROM fs_dentry WHERE parent_ino = ? AND name = ?")
-            .await?;
-        stmt.execute((parent_ino, name)).await?;
-
-        // Invalidate cache
-        self.dentry_cache.remove(parent_ino, name);
-
-        // Decrement link count on removed directory
-        let mut stmt = conn
-            .prepare_cached("UPDATE fs_inode SET nlink = nlink - 1 WHERE ino = ?")
-            .await?;
-        stmt.execute((ino,)).await?;
-
-        // Decrement parent nlink (removed directory's ".." link) and update timestamps
-        let dur = SystemTime::now().duration_since(UNIX_EPOCH)?;
-        let now_secs = dur.as_secs() as i64;
-        let now_nsec = dur.subsec_nanos() as i64;
-        let mut stmt = conn
-            .prepare_cached(
-                "UPDATE fs_inode SET nlink = nlink - 1, ctime = ?, mtime = ?, ctime_nsec = ?, mtime_nsec = ? WHERE ino = ?",
-            )
-            .await?;
-        stmt.execute((now_secs, now_secs, now_nsec, now_nsec, parent_ino))
-            .await?;
-
-        // Delete inode if no more links
-        let link_count = self.get_link_count(&conn, ino).await?;
-        if link_count == 0 {
-            let mut stmt = conn
-                .prepare_cached("DELETE FROM fs_inode WHERE ino = ?")
-                .await?;
-            stmt.execute((ino,)).await?;
-        }
-
-        Ok(())
     }
 
     async fn link(&self, ino: i64, newparent_ino: i64, newname: &str) -> Result<Stats> {
@@ -3684,8 +3720,22 @@ impl FileSystem for AgentFS {
                     .await?;
                 stmt.execute((now_dec, now_dec_nsec, dst_ino)).await?;
 
-                // Clean up destination inode if no more links and not open
-                self.purge_if_unlinked(&conn, dst_ino).await?;
+                if dst_stats.is_directory() {
+                    // A replaced (empty) directory goes with its entry, and its
+                    // ".." link leaves the parent. Checking nlink leaked the
+                    // inode of a directory created with nlink 2.
+                    let mut stmt = conn
+                        .prepare_cached("DELETE FROM fs_inode WHERE ino = ?")
+                        .await?;
+                    stmt.execute((dst_ino,)).await?;
+                    let mut stmt = conn
+                        .prepare_cached("UPDATE fs_inode SET nlink = nlink - 1 WHERE ino = ?")
+                        .await?;
+                    stmt.execute((newparent_ino,)).await?;
+                } else {
+                    // Clean up destination inode if no more links and not open
+                    self.purge_if_unlinked(&conn, dst_ino).await?;
+                }
             }
 
             // Update the dentry: change parent and/or name
@@ -5019,6 +5069,51 @@ mod tests {
         assert!(FileSystem::getattr(&fs, orphan.ino).await?.is_none());
         assert_eq!(fs.get_chunk_count(orphan.ino).await?, 0);
         assert_eq!(fs.read_file("/keep").await?.unwrap(), b"keep");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_rmdir_deletes_directory_inode() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+        let before = fs.statfs().await?.inodes;
+        let root_nlink = FileSystem::getattr(&fs, ROOT_INO).await?.unwrap().nlink;
+
+        let d = FileSystem::mkdir(&fs, ROOT_INO, "d", DEFAULT_DIR_MODE, 0, 0).await?;
+        FileSystem::rmdir(&fs, ROOT_INO, "d").await?;
+
+        assert!(FileSystem::getattr(&fs, d.ino).await?.is_none());
+        assert_eq!(fs.statfs().await?.inodes, before);
+        let root = FileSystem::getattr(&fs, ROOT_INO).await?.unwrap();
+        assert_eq!(root.nlink, root_nlink);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_rename_dir_over_empty_dir_deletes_replaced_inode() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+        let root_nlink = FileSystem::getattr(&fs, ROOT_INO).await?.unwrap().nlink;
+        let a = FileSystem::mkdir(&fs, ROOT_INO, "a", DEFAULT_DIR_MODE, 0, 0).await?;
+        let b = FileSystem::mkdir(&fs, ROOT_INO, "b", DEFAULT_DIR_MODE, 0, 0).await?;
+        let inodes = fs.statfs().await?.inodes;
+
+        FileSystem::rename(&fs, ROOT_INO, "a", ROOT_INO, "b").await?;
+
+        assert!(FileSystem::getattr(&fs, b.ino).await?.is_none());
+        assert_eq!(fs.statfs().await?.inodes, inodes - 1);
+        assert_eq!(
+            FileSystem::lookup(&fs, ROOT_INO, "b").await?.unwrap().ino,
+            a.ino
+        );
+        let root = FileSystem::getattr(&fs, ROOT_INO).await?.unwrap();
+        assert_eq!(root.nlink, root_nlink + 1);
+
+        // Same through the path API, across parents.
+        fs.mkdir("/p", 0, 0).await?;
+        fs.mkdir("/p/c", 0, 0).await?;
+        let c = fs.stat("/p/c").await?.unwrap();
+        fs.rename("/b", "/p/c").await?;
+        assert!(FileSystem::getattr(&fs, c.ino).await?.is_none());
+        assert_eq!(fs.stat("/p").await?.unwrap().nlink, 3);
         Ok(())
     }
 }
