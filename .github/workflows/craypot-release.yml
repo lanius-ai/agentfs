@@ -65,7 +65,7 @@ jobs:
         run: |
           set -eu
           file "$ASSET" | tee /dev/stderr | grep -Eq 'statically linked|static-pie linked'
-          if ldd "$ASSET"; then echo "not static"; exit 1; fi
+          ldd "$ASSET" 2>&1 | tee /dev/stderr | grep -Eq 'statically linked|not a dynamic executable'
           "./$ASSET" --version
           "./$ASSET" mount --help | grep -q -- '--max-bytes'
           sha256sum "$ASSET" > "$ASSET.sha256"
