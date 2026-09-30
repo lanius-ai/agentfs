@@ -68,10 +68,15 @@ fn maximize_fd_limit() {
     }
 }
 
-/// Cache entries never expire — we use deferred kernel cache invalidation
-/// (via Notifier::inval_entry) after mutations to keep the dcache consistent.
-/// This is safe because we are the only writer to the filesystem.
-const TTL: Duration = Duration::MAX;
+/// Cache entries effectively never expire: we use deferred kernel cache
+/// invalidation (via Notifier::inval_entry) after mutations to keep the dcache
+/// consistent. This is safe because we are the only writer to the filesystem.
+///
+/// The TTL is finite (one year) rather than `Duration::MAX`: FUSE servers such
+/// as gVisor's sentry convert `entry_valid`/`attr_valid` to signed 64-bit
+/// nanoseconds, where `u64::MAX` seconds wraps negative and every cached entry
+/// is treated as already expired (a GETATTR/LOOKUP round trip per access).
+const TTL: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 
 /// Options for mounting an agent filesystem via FUSE.
 #[derive(Debug, Clone)]
