@@ -91,6 +91,10 @@ impl Drop for Mount {
                 // Linux always returns EPERM for non-root users.  We have to let the
                 // library go through the setuid-root "fusermount -u" to unmount.
                 fuse_unmount_pure(&self.mountpoint)
+            } else if err.raw_os_error() == Some(libc::EINVAL) {
+                // Not a mount point any more: unmounted by someone else while
+                // the device did not report it (gVisor).
+                debug!("Already unmounted: {}", err)
             } else {
                 error!("Unmount failed: {}", err)
             }
