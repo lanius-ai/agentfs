@@ -1,9 +1,11 @@
 use std::process::Command;
 
 fn main() {
-    // Sandbox uses libunwind-ptrace which depends on liblzma and gcc_s.
+    // Sandbox uses libunwind-ptrace which depends on liblzma and gcc_s. Link
+    // them only with the sandbox feature so a --no-default-features build can be
+    // fully static (musl has no libgcc_s).
     #[cfg(target_os = "linux")]
-    {
+    if std::env::var_os("CARGO_FEATURE_SANDBOX").is_some() {
         println!("cargo:rustc-link-lib=lzma");
         // libgcc_s provides _Unwind_RaiseException and other exception handling symbols
         println!("cargo:rustc-link-lib=dylib=gcc_s");
