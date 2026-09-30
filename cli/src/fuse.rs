@@ -122,6 +122,9 @@ struct AgentFSFuse {
     open_files: Arc<Mutex<HashMap<u64, OpenFile>>>,
     /// Next file handle to allocate
     next_fh: AtomicU64,
+    /// Owner reported for every inode (`--uid`/`--gid`), if set.
+    uid: Option<u32>,
+    gid: Option<u32>,
 }
 
 impl Filesystem for AgentFSFuse {
@@ -172,7 +175,7 @@ impl Filesystem for AgentFSFuse {
 
         match result {
             Ok(Some(stats)) => {
-                let attr = fillattr(&stats);
+                let attr = self.fillattr(&stats);
                 reply.entry(&TTL, &attr, 0);
             }
             Ok(None) => reply.error(libc::ENOENT),
@@ -193,7 +196,7 @@ impl Filesystem for AgentFSFuse {
             .block_on(async move { fs.getattr(ino as i64).await });
 
         match result {
-            Ok(Some(stats)) => reply.attr(&TTL, &fillattr(&stats)),
+            Ok(Some(stats)) => reply.attr(&TTL, &self.fillattr(&stats)),
             Ok(None) => reply.error(libc::ENOENT),
             Err(e) => reply.error(error_to_errno(&e)),
         }
@@ -341,7 +344,7 @@ impl Filesystem for AgentFSFuse {
             .block_on(async move { fs.getattr(ino as i64).await });
 
         match result {
-            Ok(Some(stats)) => reply.attr(&TTL, &fillattr(&stats)),
+            Ok(Some(stats)) => reply.attr(&TTL, &self.fillattr(&stats)),
             Ok(None) => reply.error(libc::ENOENT),
             Err(e) => reply.error(error_to_errno(&e)),
         }
@@ -480,7 +483,7 @@ impl Filesystem for AgentFSFuse {
         // Add "." entry
         if offset <= offset_counter {
             if let Some(ref stats) = dir_stats {
-                let attr = fillattr(stats);
+                let attr = self.fillattr(stats);
                 if reply.add(ino, offset_counter + 1, ".", &TTL, &attr, 0) {
                     reply.ok();
                     return;
@@ -492,7 +495,7 @@ impl Filesystem for AgentFSFuse {
         // Add ".." entry
         if offset <= offset_counter {
             if let Some(ref stats) = parent_stats {
-                let attr = fillattr(stats);
+                let attr = self.fillattr(stats);
                 if reply.add(parent_ino, offset_counter + 1, "..", &TTL, &attr, 0) {
                     reply.ok();
                     return;
@@ -504,7 +507,7 @@ impl Filesystem for AgentFSFuse {
         // Add directory entries with their attributes
         for entry in &entries {
             if offset <= offset_counter {
-                let attr = fillattr(&entry.stats);
+                let attr = self.fillattr(&entry.stats);
 
                 if reply.add(
                     entry.stats.ino as u64,
@@ -562,7 +565,7 @@ impl Filesystem for AgentFSFuse {
 
         match result {
             Ok(stats) => {
-                let attr = fillattr(&stats);
+                let attr = self.fillattr(&stats);
                 reply.entry(&TTL, &attr, 0);
             }
             Err(e) => {
@@ -606,7 +609,7 @@ impl Filesystem for AgentFSFuse {
 
         match result {
             Ok(stats) => {
-                let attr = fillattr(&stats);
+                let attr = self.fillattr(&stats);
                 reply.entry(&TTL, &attr, 0);
             }
             Err(e) => {
@@ -684,7 +687,7 @@ impl Filesystem for AgentFSFuse {
 
         match result {
             Ok((stats, file)) => {
-                let attr = fillattr(&stats);
+                let attr = self.fillattr(&stats);
 
                 let fh = self.alloc_fh();
                 self.open_files.lock().insert(fh, OpenFile { file });
@@ -737,7 +740,7 @@ impl Filesystem for AgentFSFuse {
 
         match result {
             Ok(stats) => {
-                let attr = fillattr(&stats);
+                let attr = self.fillattr(&stats);
                 reply.entry(&TTL, &attr, 0);
             }
             Err(e) => {
@@ -778,7 +781,7 @@ impl Filesystem for AgentFSFuse {
 
         match result {
             Ok(stats) => {
-                let attr = fillattr(&stats);
+                let attr = self.fillattr(&stats);
                 reply.entry(&TTL, &attr, 0);
             }
             Err(e) => {
@@ -1097,12 +1100,14 @@ impl AgentFSFuse {
     ///
     /// The provided Tokio runtime is used to execute async FileSystem operations
     /// from within synchronous FUSE callbacks via `block_on`.
-    fn new(fs: Arc<dyn FileSystem>, runtime: Runtime) -> Self {
+    fn new(fs: Arc<dyn FileSystem>, runtime: Runtime, uid: Option<u32>, gid: Option<u32>) -> Self {
         Self {
             fs,
             runtime,
             open_files: Arc::new(Mutex::new(HashMap::new())),
             next_fh: AtomicU64::new(1),
+            uid,
+            gid,
         }
     }
 
@@ -1113,55 +1118,56 @@ impl AgentFSFuse {
     fn alloc_fh(&self) -> u64 {
         self.next_fh.fetch_add(1, Ordering::SeqCst)
     }
+
+    /// Fill a `FileAttr` from AgentFS stats.
+    ///
+    /// Similar to the Linux kernel's `generic_fillattr()`, this converts
+    /// filesystem-specific stat information into the VFS attribute structure.
+    ///
+    /// `--uid`/`--gid` override the stored owner of every inode. A database
+    /// written elsewhere (e.g. sealed as uid 0) is then usable by the mounting
+    /// user under `default_permissions`, and git sees no "dubious ownership".
+    fn fillattr(&self, stats: &Stats) -> FileAttr {
+        let file_type = stats.mode & S_IFMT;
+        let kind = match file_type {
+            S_IFDIR => FileType::Directory,
+            S_IFLNK => FileType::Symlink,
+            S_IFIFO => FileType::NamedPipe,
+            S_IFCHR => FileType::CharDevice,
+            S_IFBLK => FileType::BlockDevice,
+            S_IFSOCK => FileType::Socket,
+            _ => FileType::RegularFile,
+        };
+
+        let size = if file_type == S_IFDIR {
+            4096_u64 // Standard directory size
+        } else {
+            stats.size as u64
+        };
+
+        FileAttr {
+            ino: stats.ino as u64,
+            size,
+            blocks: size.div_ceil(512),
+            atime: UNIX_EPOCH + Duration::new(stats.atime as u64, stats.atime_nsec),
+            mtime: UNIX_EPOCH + Duration::new(stats.mtime as u64, stats.mtime_nsec),
+            ctime: UNIX_EPOCH + Duration::new(stats.ctime as u64, stats.ctime_nsec),
+            crtime: UNIX_EPOCH,
+            kind,
+            perm: (stats.mode & 0o7777) as u16,
+            nlink: stats.nlink,
+            uid: self.uid.unwrap_or(stats.uid),
+            gid: self.gid.unwrap_or(stats.gid),
+            rdev: stats.rdev as u32,
+            flags: 0,
+            blksize: 512,
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────
 // Attribute Conversion
 // ─────────────────────────────────────────────────────────────
-
-/// Fill a `FileAttr` from AgentFS stats.
-///
-/// Similar to the Linux kernel's `generic_fillattr()`, this converts
-/// filesystem-specific stat information into the VFS attribute structure.
-///
-/// The uid and gid parameters override the stored values to ensure proper
-/// file ownership reporting (avoids "dubious ownership" errors from git).
-fn fillattr(stats: &Stats) -> FileAttr {
-    let file_type = stats.mode & S_IFMT;
-    let kind = match file_type {
-        S_IFDIR => FileType::Directory,
-        S_IFLNK => FileType::Symlink,
-        S_IFIFO => FileType::NamedPipe,
-        S_IFCHR => FileType::CharDevice,
-        S_IFBLK => FileType::BlockDevice,
-        S_IFSOCK => FileType::Socket,
-        _ => FileType::RegularFile,
-    };
-
-    let size = if file_type == S_IFDIR {
-        4096_u64 // Standard directory size
-    } else {
-        stats.size as u64
-    };
-
-    FileAttr {
-        ino: stats.ino as u64,
-        size,
-        blocks: size.div_ceil(512),
-        atime: UNIX_EPOCH + Duration::new(stats.atime as u64, stats.atime_nsec),
-        mtime: UNIX_EPOCH + Duration::new(stats.mtime as u64, stats.mtime_nsec),
-        ctime: UNIX_EPOCH + Duration::new(stats.ctime as u64, stats.ctime_nsec),
-        crtime: UNIX_EPOCH,
-        kind,
-        perm: (stats.mode & 0o7777) as u16,
-        nlink: stats.nlink,
-        uid: stats.uid,
-        gid: stats.gid,
-        rdev: stats.rdev as u32,
-        flags: 0,
-        blksize: 512,
-    }
-}
 
 /// Check if allow_other is supported for FUSE mounts.
 ///
@@ -1199,7 +1205,7 @@ pub fn mount(
     // when passthrough filesystems cache O_PATH file descriptors
     maximize_fd_limit();
 
-    let fs = AgentFSFuse::new(fs, runtime);
+    let fs = AgentFSFuse::new(fs, runtime, opts.uid, opts.gid);
 
     let mut mount_opts = vec![
         MountOption::FSName(opts.fsname),
@@ -1230,4 +1236,47 @@ pub fn mount(
     crate::fuser::mount2(fs, &opts.mountpoint, &mount_opts)?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stats(uid: u32, gid: u32) -> Stats {
+        Stats {
+            ino: 2,
+            mode: agentfs_sdk::filesystem::S_IFREG | 0o600,
+            nlink: 1,
+            uid,
+            gid,
+            size: 0,
+            atime: 0,
+            mtime: 0,
+            ctime: 0,
+            atime_nsec: 0,
+            mtime_nsec: 0,
+            ctime_nsec: 0,
+            rdev: 0,
+        }
+    }
+
+    fn adapter(uid: Option<u32>, gid: Option<u32>) -> AgentFSFuse {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = Runtime::new().unwrap();
+        let path = dir.path().join("t.db");
+        let fs = runtime
+            .block_on(agentfs_sdk::filesystem::AgentFS::new(
+                path.to_str().unwrap(),
+            ))
+            .unwrap();
+        AgentFSFuse::new(Arc::new(fs), runtime, uid, gid)
+    }
+
+    #[test]
+    fn fillattr_reports_mount_owner() {
+        let a = adapter(Some(1000), Some(1001)).fillattr(&stats(0, 0));
+        assert_eq!((a.uid, a.gid), (1000, 1001));
+        let a = adapter(None, None).fillattr(&stats(7, 8));
+        assert_eq!((a.uid, a.gid), (7, 8));
+    }
 }
