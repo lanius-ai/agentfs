@@ -2723,6 +2723,37 @@ impl AgentFS {
         Ok(())
     }
 
+    /// Whether directory `ancestor` is `ino` or one of its ancestors, walking
+    /// `fs_dentry` parents up to the root.
+    // ponytail: one unindexed fs_dentry lookup per level (turso 0.4 has no
+    // recursive CTEs and there is no index on fs_dentry.ino); only paid by
+    // cross-directory renames of directories.
+    async fn is_ancestor(&self, conn: &Connection, ancestor: i64, mut ino: i64) -> Result<bool> {
+        let mut seen = std::collections::HashSet::new();
+        let mut stmt = conn
+            .prepare_cached("SELECT parent_ino FROM fs_dentry WHERE ino = ? LIMIT 1")
+            .await?;
+        loop {
+            if ino == ancestor {
+                return Ok(true);
+            }
+            if ino == ROOT_INO || !seen.insert(ino) {
+                return Ok(false);
+            }
+            let mut rows = stmt.query((ino,)).await?;
+            let parent = match rows.next().await? {
+                Some(row) => row.get_value(0).ok().and_then(|v| v.as_integer().copied()),
+                None => None,
+            };
+            drop(rows);
+            stmt.reset()?;
+            match parent {
+                Some(p) => ino = p,
+                None => return Ok(false),
+            }
+        }
+    }
+
     /// Get the number of chunks for a given inode (for testing)
     #[cfg(test)]
     async fn get_chunk_count(&self, ino: i64) -> Result<i64> {
@@ -3670,6 +3701,15 @@ impl FileSystem for AgentFS {
         let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
 
         let result: Result<()> = async {
+            // A directory cannot move into its own subtree: that would detach
+            // it into a cycle unreachable from the root.
+            if src_stats.is_directory()
+                && oldparent_ino != newparent_ino
+                && self.is_ancestor(&conn, src_ino, newparent_ino).await?
+            {
+                return Err(FsError::InvalidRename.into());
+            }
+
             // Check if destination exists
             if let Some(dst_ino) = self.lookup_child(&conn, newparent_ino, newname).await? {
                 let dst_stats = self.getattr_with_conn(&conn, dst_ino).await?.ok_or(FsError::NotFound)?;
@@ -5114,6 +5154,38 @@ mod tests {
         fs.rename("/b", "/p/c").await?;
         assert!(FileSystem::getattr(&fs, c.ino).await?.is_none());
         assert_eq!(fs.stat("/p").await?.unwrap().nlink, 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_rename_dir_into_own_descendant_is_einval() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+        let a = FileSystem::mkdir(&fs, ROOT_INO, "a", DEFAULT_DIR_MODE, 0, 0).await?;
+        let b = FileSystem::mkdir(&fs, a.ino, "b", DEFAULT_DIR_MODE, 0, 0).await?;
+        let c = FileSystem::mkdir(&fs, b.ino, "c", DEFAULT_DIR_MODE, 0, 0).await?;
+
+        for (parent, name) in [(c.ino, "x"), (b.ino, "x"), (a.ino, "x")] {
+            let err = FileSystem::rename(&fs, ROOT_INO, "a", parent, name)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, Error::Fs(FsError::InvalidRename)), "{err:?}");
+        }
+        // Tree unchanged and still reachable.
+        assert_eq!(
+            FileSystem::lookup(&fs, ROOT_INO, "a").await?.unwrap().ino,
+            a.ino
+        );
+        assert_eq!(
+            FileSystem::lookup(&fs, b.ino, "c").await?.unwrap().ino,
+            c.ino
+        );
+
+        // Moving a subdirectory up out of the source is fine.
+        FileSystem::rename(&fs, b.ino, "c", ROOT_INO, "c").await?;
+        assert_eq!(
+            FileSystem::lookup(&fs, ROOT_INO, "c").await?.unwrap().ino,
+            c.ino
+        );
         Ok(())
     }
 }
