@@ -69,6 +69,10 @@ smallvec = "1.6"
 zerocopy = { version = "0.8", features = ["derive"] }
 nix = { version = "0.29", features = ["fs", "user"] }
 
+# Static musl builds (craypot release): build OpenSSL (turso's native-tls) from source.
+[target.'cfg(all(target_os = "linux", target_env = "musl"))'.dependencies]
+openssl = { version = "0.10", features = ["vendored"] }
+
 # macOS dependencies for NFS functionality (no FUSE - uses nfsserve instead)
 [target.'cfg(target_os = "macos")'.dependencies]
 # Ensure transitive `aegis` (pulled in by `turso`) builds on macOS arm64 by

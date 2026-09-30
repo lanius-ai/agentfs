@@ -19,6 +19,41 @@
 
 ---
 
+## craypot fork (lanius-ai/agentfs, branch `craypot`)
+
+This fork carries the patches craypot needs to run `agentfs mount` as the live
+workspace inside gVisor actors. It is not an upstream release.
+
+- **Base:** v0.6.4 (`3a5ed2b`), the version craypot's Go SDK pins
+  (`github.com/tursodatabase/agentfs/sdk/go v0.0.0-...-3a5ed2b88e5d`) and the one
+  the design research was done on. Upstream `main` at fork time (`0a014eb`) only
+  adds two clippy fixes in `cli/src/cmd/{init,ps}.rs`, so there was nothing to
+  gain from basing on it. Rebase onto a new upstream release, never merge.
+- **Patches** (one commit each, with tests):
+  - finite one-year entry/attr TTL (`Duration::MAX` wraps negative in gVisor);
+  - `FOPEN_KEEP_CACHE | FOPEN_NOFLUSH` on open/create, never `DIRECT_IO`;
+  - `mount --uid/--gid` reported as the owner of every inode;
+  - unlinked-but-open inodes live until the last release; orphans purged at mount;
+  - unlink/rmdir in one IMMEDIATE transaction; removed/replaced directory inodes deleted;
+  - rename of a directory into its own subtree returns EINVAL;
+  - FIFO/socket/device `d_type` in readdir;
+  - `mount --max-bytes/--max-inodes` quotas (ENOSPC, reported by statfs);
+  - `wal_checkpoint(TRUNCATE)` on SIGTERM (exit 0) and after unmount;
+  - build: lzma/gcc_s linked only with the `sandbox` feature (static musl build);
+    OpenSSL vendored for musl; nightly pinned in `cli/rust-toolchain.toml`.
+- **Release:** `.github/workflows/craypot-release.yml` runs on every push to
+  `craypot`: `cargo test` (sdk/rust, cli with `--no-default-features`), a static
+  `x86_64-unknown-linux-musl` build with `--no-default-features`, and
+  `cli/tests/test-craypot-fuse.sh` against that binary on host FUSE. It publishes
+  release `craypot-<yyyymmdd>-<shortsha>` with assets
+  `agentfs-x86_64-unknown-linux-musl` and `agentfs-x86_64-unknown-linux-musl.sha256`.
+- **Mount contract used by craypot:**
+  `agentfs mount <db> <mnt> --foreground --uid N --gid N --system --max-bytes B --max-inodes N`
+  (`--allow-other` is an alias of `--system`). Mounting writes the database
+  (schema init, orphan purge): hash it before mounting.
+
+---
+
 > **⚠️ Warning:** This software is in BETA. It may still contain bugs and unexpected behavior. Use caution with production data and ensure you have backups.
 
 ## 🎯 What is AgentFS?

@@ -1,0 +1,92 @@
+# Static linux/amd64 agentfs for craypot actors (see README "craypot fork").
+# Every push to the craypot branch (or a craypot-* tag) is tested and published
+# as release craypot-<yyyymmdd>-<shortsha> with the binary and its .sha256.
+name: craypot release
+
+on:
+  push:
+    branches: [craypot]
+    tags: ['craypot-*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  TARGET: x86_64-unknown-linux-musl
+  ASSET: agentfs-x86_64-unknown-linux-musl
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # build.rs runs git describe for --version
+
+      - name: Install toolchain (pinned in cli/rust-toolchain.toml)
+        run: |
+          set -eu
+          toolchain=$(sed -n 's/^channel = "\(.*\)"/\1/p' cli/rust-toolchain.toml)
+          echo "RUSTUP_TOOLCHAIN=$toolchain" >> "$GITHUB_ENV"
+          rustup toolchain install "$toolchain" --profile minimal --target "$TARGET"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools fuse3
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            cli/target
+            sdk/rust/target
+          key: craypot-${{ runner.os }}-${{ hashFiles('cli/rust-toolchain.toml', 'cli/Cargo.lock') }}
+
+      - name: Test sdk/rust
+        working-directory: sdk/rust
+        run: cargo test
+
+      - name: Test cli
+        working-directory: cli
+        run: cargo test --no-default-features
+
+      - name: Build static binary
+        working-directory: cli
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CARGO_PROFILE_RELEASE_STRIP: symbols
+        run: |
+          set -eu
+          cargo build --release --no-default-features --target "$TARGET"
+          cp "target/$TARGET/release/agentfs" "$GITHUB_WORKSPACE/$ASSET"
+
+      - name: Check binary
+        run: |
+          set -eu
+          file "$ASSET" | tee /dev/stderr | grep -Eq 'statically linked|static-pie linked'
+          if ldd "$ASSET"; then echo "not static"; exit 1; fi
+          "./$ASSET" --version
+          "./$ASSET" mount --help | grep -q -- '--max-bytes'
+          sha256sum "$ASSET" > "$ASSET.sha256"
+          cat "$ASSET.sha256"
+
+      - name: Host-FUSE test of the static binary
+        run: cli/tests/test-craypot-fuse.sh "$ASSET"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            tag=$GITHUB_REF_NAME
+          else
+            tag="craypot-$(date -u +%Y%m%d)-$(git rev-parse --short=7 HEAD)"
+          fi
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "$ASSET" "$ASSET.sha256" --clobber
+          else
+            gh release create "$tag" "$ASSET" "$ASSET.sha256" --target "$GITHUB_SHA" \
+              --title "$tag" --notes "Static agentfs for craypot from $GITHUB_SHA. sha256: $(cut -d' ' -f1 "$ASSET.sha256")"
+          fi
