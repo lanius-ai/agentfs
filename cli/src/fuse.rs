@@ -402,15 +402,11 @@ impl Filesystem for AgentFSFuse {
 
         // Process entries with stats already available (no N+1 queries!)
         for entry in &entries {
-            let kind = if entry.stats.is_directory() {
-                FileType::Directory
-            } else if entry.stats.is_symlink() {
-                FileType::Symlink
-            } else {
-                FileType::RegularFile
-            };
-
-            all_entries.push((entry.stats.ino as u64, kind, entry.name.as_str()));
+            all_entries.push((
+                entry.stats.ino as u64,
+                file_type(entry.stats.mode),
+                entry.name.as_str(),
+            ));
         }
 
         for (i, entry) in all_entries.iter().enumerate().skip(offset as usize) {
@@ -1138,18 +1134,9 @@ impl AgentFSFuse {
     /// written elsewhere (e.g. sealed as uid 0) is then usable by the mounting
     /// user under `default_permissions`, and git sees no "dubious ownership".
     fn fillattr(&self, stats: &Stats) -> FileAttr {
-        let file_type = stats.mode & S_IFMT;
-        let kind = match file_type {
-            S_IFDIR => FileType::Directory,
-            S_IFLNK => FileType::Symlink,
-            S_IFIFO => FileType::NamedPipe,
-            S_IFCHR => FileType::CharDevice,
-            S_IFBLK => FileType::BlockDevice,
-            S_IFSOCK => FileType::Socket,
-            _ => FileType::RegularFile,
-        };
+        let kind = file_type(stats.mode);
 
-        let size = if file_type == S_IFDIR {
+        let size = if kind == FileType::Directory {
             4096_u64 // Standard directory size
         } else {
             stats.size as u64
@@ -1178,6 +1165,19 @@ impl AgentFSFuse {
 // ─────────────────────────────────────────────────────────────
 // Attribute Conversion
 // ─────────────────────────────────────────────────────────────
+
+/// Map an inode mode to its FUSE file type (also the readdir d_type).
+fn file_type(mode: u32) -> FileType {
+    match mode & S_IFMT {
+        S_IFDIR => FileType::Directory,
+        S_IFLNK => FileType::Symlink,
+        S_IFIFO => FileType::NamedPipe,
+        S_IFCHR => FileType::CharDevice,
+        S_IFBLK => FileType::BlockDevice,
+        S_IFSOCK => FileType::Socket,
+        _ => FileType::RegularFile,
+    }
+}
 
 /// Check if allow_other is supported for FUSE mounts.
 ///
