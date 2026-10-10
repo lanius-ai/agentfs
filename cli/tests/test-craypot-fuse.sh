@@ -161,8 +161,16 @@ echo OK
 LOG="$WORK/debug.log"
 requests() { grep -c "FUSE::$1" "$LOG" || true; }
 
-echo -n "TEST directory listings are cached (opendir ENOSYS)... "
+echo -n "TEST absent names are cached (negative entries)... "
 RUST_LOG=agentfs::fuse=debug mount_fs --uid "$(id -u)" --gid "$(id -g)" >"$LOG" 2>&1
+for _ in 1 2 3; do [ ! -e "$MNT/absent" ] || fail "absent exists"; done
+n=$(requests 'lookup: parent=1, name="absent"')
+[ "$n" = 1 ] || fail "$n LOOKUPs of an absent name, want 1"
+echo now > "$MNT/absent"
+[ "$(cat "$MNT/absent")" = now ] || fail "created name still absent"
+echo OK
+
+echo -n "TEST directory listings are cached (opendir ENOSYS)... "
 mkdir "$MNT/ls"; touch "$MNT/ls/a"
 ls "$MNT/ls" >/dev/null
 n1=$(requests readdir)

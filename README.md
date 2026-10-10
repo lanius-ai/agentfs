@@ -42,8 +42,12 @@ workspace inside gVisor actors. It is not an upstream release.
   - opendir answers ENOSYS (`FUSE_NO_OPENDIR_SUPPORT` took no effect while
     fuser's default opendir succeeded): the kernel stops sending
     OPENDIR/RELEASEDIR and caches listings (`FOPEN_CACHE_DIR`);
-    requires Linux or lanius-ai/gvisor `craypot` after `02662ded0` (older
-    gVisor fails opendir with ENOSYS);
+  - absent names get a negative entry (inode 0, entry TTL) instead of ENOENT,
+    so the kernel caches them (git probes `.gitignore` in every directory);
+  - with these, a warm `git status` sends no READDIR or LOOKUP. Requires a
+    kernel that implements both (Linux, or lanius-ai/gvisor `craypot` from
+    the release after `02662ded0`): older gVisor fails opendir with ENOSYS
+    and maps negative entries to EIO;
   - build: lzma/gcc_s linked only with the `sandbox` feature (static musl build);
     OpenSSL vendored for musl; nightly pinned in `cli/rust-toolchain.toml`.
 - **Release:** `.github/workflows/craypot-release.yml` runs on every push to

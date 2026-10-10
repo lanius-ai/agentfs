@@ -81,6 +81,25 @@ fn maximize_fd_limit() {
 /// is treated as already expired (a GETATTR/LOOKUP round trip per access).
 const TTL: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 
+/// A negative entry: a LOOKUP reply with inode 0 tells the kernel the name
+/// doesn't exist for the reply's entry TTL (Linux fuse_lookup_name()).
+const NEGATIVE_ENTRY: FileAttr = FileAttr {
+    ino: 0,
+    size: 0,
+    blocks: 0,
+    atime: UNIX_EPOCH,
+    mtime: UNIX_EPOCH,
+    ctime: UNIX_EPOCH,
+    crtime: UNIX_EPOCH,
+    kind: FileType::RegularFile,
+    perm: 0,
+    nlink: 0,
+    uid: 0,
+    gid: 0,
+    rdev: 0,
+    blksize: 0,
+    flags: 0,
+};
 
 /// FOPEN flags for every open/create reply.
 ///
@@ -192,7 +211,12 @@ impl Filesystem for AgentFSFuse {
 
     /// Looks up a directory entry by name within a parent directory.
     ///
-    /// Resolves `name` under the directory identified by `parent` inode.
+    /// Resolves `name` under the directory identified by `parent` inode. A
+    /// missing name gets a negative entry (inode 0) valid for TTL rather than
+    /// ENOENT, so the kernel caches the absence: tools probe for absent files
+    /// constantly (git: `.gitignore` in every directory, `.git/MERGE_HEAD`,
+    /// refs). The kernel drops a negative entry when it creates that name,
+    /// and every creation goes through the kernel (single writer, see TTL).
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
         tracing::debug!("FUSE::lookup: parent={}, name={:?}", parent, name);
 
@@ -212,7 +236,7 @@ impl Filesystem for AgentFSFuse {
                 let attr = self.fillattr(&stats);
                 reply.entry(&TTL, &attr, 0);
             }
-            Ok(None) => reply.error(libc::ENOENT),
+            Ok(None) => reply.entry(&TTL, &NEGATIVE_ENTRY, 0),
             Err(e) => reply.error(error_to_errno(&e)),
         }
     }
