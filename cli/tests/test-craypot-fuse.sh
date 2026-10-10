@@ -157,9 +157,14 @@ echo -n "TEST SIGTERM checkpoint... "
 stop_term
 echo OK
 
-echo -n "TEST umount checkpoint... "
+echo -n "TEST umount checkpoint after a rolled-back transaction... "
 mount_fs --uid "$(id -u)" --gid "$(id -g)"
 echo data > "$MNT/after"
+# rmdir of a non-empty directory fails inside its IMMEDIATE txn (ROLLBACK).
+# turso 0.4.4 leaked a WAL lock on ROLLBACK, so every later
+# wal_checkpoint(TRUNCATE) in the process reported busy.
+mkdir -p "$MNT/full/x"
+if rmdir "$MNT/full" 2>/dev/null; then fail "rmdir of a non-empty dir succeeded"; fi
 fusermount3 -u "$MNT"
 rc=0; wait "$PID" || rc=$?; PID=
 [ "$rc" = 0 ] || fail "exit status $rc after umount"
