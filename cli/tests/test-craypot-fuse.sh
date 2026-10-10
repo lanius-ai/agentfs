@@ -157,6 +157,23 @@ echo -n "TEST SIGTERM checkpoint... "
 stop_term
 echo OK
 
+# The kernel caches what the server lets it: count the requests agentfs logs.
+LOG="$WORK/debug.log"
+requests() { grep -c "FUSE::$1" "$LOG" || true; }
+
+echo -n "TEST directory listings are cached (opendir ENOSYS)... "
+RUST_LOG=agentfs::fuse=debug mount_fs --uid "$(id -u)" --gid "$(id -g)" >"$LOG" 2>&1
+mkdir "$MNT/ls"; touch "$MNT/ls/a"
+ls "$MNT/ls" >/dev/null
+n1=$(requests readdir)
+[ "$(ls "$MNT/ls")" = a ] || fail "listing $(ls "$MNT/ls")"
+n2=$(requests readdir)
+[ "$n2" = "$n1" ] || fail "second listing sent $((n2 - n1)) READDIRs, want 0"
+touch "$MNT/ls/b"
+[ "$(ls "$MNT/ls" | tr '\n' ' ')" = "a b " ] || fail "listing after create: $(ls "$MNT/ls")"
+stop_term
+echo OK
+
 echo -n "TEST umount checkpoint after a rolled-back transaction... "
 mount_fs --uid "$(id -u)" --gid "$(id -g)"
 echo data > "$MNT/after"

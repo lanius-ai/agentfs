@@ -70,13 +70,17 @@ fn maximize_fd_limit() {
 
 /// Cache entries effectively never expire: we use deferred kernel cache
 /// invalidation (via Notifier::inval_entry) after mutations to keep the dcache
-/// consistent. This is safe because we are the only writer to the filesystem.
+/// consistent. This is safe because we are the only writer to the filesystem:
+/// every change arrives as a request from the kernel, which updates its own
+/// caches (attributes, entries, negative entries, directory listings) for
+/// changes it makes. Nothing may change the database behind a mount.
 ///
 /// The TTL is finite (one year) rather than `Duration::MAX`: FUSE servers such
 /// as gVisor's sentry convert `entry_valid`/`attr_valid` to signed 64-bit
 /// nanoseconds, where `u64::MAX` seconds wraps negative and every cached entry
 /// is treated as already expired (a GETATTR/LOOKUP round trip per access).
 const TTL: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+
 
 /// FOPEN flags for every open/create reply.
 ///
@@ -387,6 +391,20 @@ impl Filesystem for AgentFSFuse {
     // ─────────────────────────────────────────────────────────────
     // Directory Operations
     // ─────────────────────────────────────────────────────────────
+
+    /// Answers ENOSYS, which with `FUSE_NO_OPENDIR_SUPPORT` (set in `init`)
+    /// tells the kernel to open directories without a request from then on
+    /// and to cache their listings (`FOPEN_KEEP_CACHE | FOPEN_CACHE_DIR`).
+    /// Directory handles carry no state here (`readdir` ignores `fh`).
+    ///
+    /// fuser's default reply (fh 0, no flags) would make the kernel send
+    /// OPENDIR and RELEASEDIR for every open and read every listing again.
+    /// The listing cache is safe because every change to a directory goes
+    /// through this mount; changes made through the kernel drop it.
+    fn opendir(&mut self, _req: &Request, ino: u64, _flags: i32, reply: ReplyOpen) {
+        tracing::debug!("FUSE::opendir: ino={}", ino);
+        reply.error(libc::ENOSYS);
+    }
 
     /// Reads directory entries for the given inode.
     ///

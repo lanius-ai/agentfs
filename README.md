@@ -39,6 +39,11 @@ workspace inside gVisor actors. It is not an upstream release.
   - FIFO/socket/device `d_type` in readdir;
   - `mount --max-bytes/--max-inodes` quotas (ENOSPC, reported by statfs);
   - `wal_checkpoint(TRUNCATE)` on SIGTERM (exit 0) and after unmount;
+  - opendir answers ENOSYS (`FUSE_NO_OPENDIR_SUPPORT` took no effect while
+    fuser's default opendir succeeded): the kernel stops sending
+    OPENDIR/RELEASEDIR and caches listings (`FOPEN_CACHE_DIR`);
+    requires Linux or lanius-ai/gvisor `craypot` after `02662ded0` (older
+    gVisor fails opendir with ENOSYS);
   - build: lzma/gcc_s linked only with the `sandbox` feature (static musl build);
     OpenSSL vendored for musl; nightly pinned in `cli/rust-toolchain.toml`.
 - **Release:** `.github/workflows/craypot-release.yml` runs on every push to
